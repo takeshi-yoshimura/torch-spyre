@@ -51,6 +51,23 @@ class SpyreStream {
   void copyProgramAsync(void* prog_cpu_ptr,
                         const flex::CompositeAddress* device_address) const;
 
+  /**
+   * Raw H2D DMA from an aligned CPU uint8 tensor to a Spyre tensor.
+   *
+   * The buffer must already contain device-format bytes, either converted on
+   * the host or read from a native checkpoint. No conversion is performed.
+   *
+   * flex manages IOMMU mapping. Keep both tensors alive and the buffer
+   * unchanged until the stream completes successfully.
+   *
+   * @param buffer Aligned host storage containing the data.
+   * @param dst    Spyre tensor (destination).
+   */
+  void copyRawH2DAsync(const at::Tensor& buffer, const at::Tensor& dst) const;
+
+  // Same borrowed-buffer contract as raw H2D, preserving physical device bytes.
+  void copyRawD2HAsync(const at::Tensor& buffer, const at::Tensor& src) const;
+
   void launch(const JobPlan& plan, const std::vector<at::Tensor>& args,
               std::vector<SymbolicArg> symbolic_args = {}) const;
 

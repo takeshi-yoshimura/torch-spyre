@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "host_transfer.h"
 #include "job_plan.h"
 #include "logging.h"
 #include "module.h"
@@ -502,6 +503,51 @@ flex::HostComputeBuffer* SpyreStream::launchHostCompute(
     flex::HostComputeParams* params) const {
   RECORD_FUNCTION("launch::HostCompute", {});
   return resolveRuntimeHandle()->launchOperation(params);
+}
+
+void SpyreStream::copyRawH2DAsync(const at::Tensor& buffer,
+                               const at::Tensor& dst) const {
+  RECORD_FUNCTION("launch::CopyRawH2D", {});
+
+  TORCH_CHECK(dst.is_privateuseone(),
+              "SpyreStream::copyRawH2DAsync: dst must be on Spyre, got ",
+              dst.device());
+  TORCH_CHECK(buffer.is_cpu() && buffer.scalar_type() == at::kByte &&
+                  buffer.is_contiguous(),
+              "SpyreStream::copyRawH2DAsync: buffer must be contiguous CPU uint8");
+  c10::DeviceGuard device_guard(dst.device());
+  const size_t alignment = host_buffer_alignment();
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(buffer.data_ptr()) % alignment == 0,
+              "SpyreStream::copyRawH2DAsync: buffer is not IOMMU-aligned");
+
+  // No pre-mapped IOVA: flex validates capacity and maps the host buffer.
+  const flex::CompositeAddress* addr = get_composite_address(dst);
+  auto params = std::unique_ptr<flex::CopyRawParams,
+                                decltype(&flex::destroyCopyRawParams)>(
+      flex::createCopyRawParams(buffer.data_ptr(), buffer.nbytes(), addr, true),
+      &flex::destroyCopyRawParams);
+  resolveRuntimeHandle()->launchOperation(params.get());
+}
+
+void SpyreStream::copyRawD2HAsync(const at::Tensor& buffer,
+                                const at::Tensor& src) const {
+  RECORD_FUNCTION("launch::CopyRawD2H", {});
+  TORCH_CHECK(src.is_privateuseone(),
+              "SpyreStream::copyRawD2HAsync: src must be on Spyre, got ",
+              src.device());
+  TORCH_CHECK(buffer.is_cpu() && buffer.scalar_type() == at::kByte &&
+                  buffer.is_contiguous(),
+              "SpyreStream::copyRawD2HAsync: buffer must be contiguous CPU uint8");
+  c10::DeviceGuard device_guard(src.device());
+  const size_t alignment = host_buffer_alignment();
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(buffer.data_ptr()) % alignment == 0,
+              "SpyreStream::copyRawD2HAsync: buffer is not IOMMU-aligned");
+  auto params = std::unique_ptr<flex::CopyRawParams,
+                                decltype(&flex::destroyCopyRawParams)>(
+      flex::createCopyRawParams(buffer.data_ptr(), buffer.nbytes(),
+                                get_composite_address(src), false),
+      &flex::destroyCopyRawParams);
+  resolveRuntimeHandle()->launchOperation(params.get());
 }
 
 void SpyreStream::launch(const JobPlan& plan,

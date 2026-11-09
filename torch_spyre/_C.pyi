@@ -612,6 +612,51 @@ def spyre_empty_reserved(
     tensor.to("spyre", dynamic={dim: {min, max, granularity}}).
     """
 
+def allocate_host_buffer(nbytes: int, device: torch.device) -> torch.Tensor:
+    """Ordinary CPU uint8 storage aligned for raw Spyre DMA."""
+    ...
+
+def dma_bytes(dst: torch.Tensor) -> int:
+    """Physical transfer size; 0 for a multi-chunk allocation."""
+    ...
+
+def enqueue_copy_raw_h2d(buffer: torch.Tensor, dst: torch.Tensor) -> None:
+    """Borrow both tensors until synchronization succeeds on this thread's stream.
+
+    The caller owns their lifetime; enqueue failure does not drain earlier work.
+    """
+    ...
+
+def synchronize_raw_h2d(device: torch.device) -> None:
+    """Wait on this thread's current stream; failure does not guarantee completion.
+
+    On failure, keep borrowed buffers and destinations alive and do not reuse them.
+    """
+    ...
+
+def enqueue_copy_raw_d2h(buffer: torch.Tensor, src: torch.Tensor) -> None:
+    """Borrow aligned CPU uint8 storage for physical device bytes, without conversion.
+
+    Keep both tensors alive and unchanged until synchronize_raw_transfers succeeds
+    on the same current stream. On failure, retain them and do not reuse storage.
+    """
+    ...
+
+def synchronize_raw_transfers(device: torch.device) -> None:
+    """Wait for raw H2D/D2H on the current stream; reject failed or shut-down streams.
+
+    Alias of synchronize_raw_h2d, with the same borrowed-storage failure contract.
+    """
+    ...
+def convert_h2d_into(
+    entries: list[tuple[typing.Any, torch.Tensor, torch.Tensor]],
+    num_threads: int = 0,
+) -> None:
+    """Convert each (buffer, cpu_tensor, dst_tensor) into its writable host buffer:
+    the bytes copy_tensor(cpu_tensor, dst_tensor) would DMA."""
+    ...
+
+def host_convert_batch(entries: list[typing.Any], num_threads: int = 0) -> None: ...
 def spyre_empty_with_layout(
     size: tuple[int, ...],
     stride: tuple[int, ...],

@@ -50,6 +50,7 @@
 
 #include "logging.h"
 #include "logging_bindings.h"
+#include "host_transfer.h"
 #include "logging_config.h"
 #include "perm_layout_native.h"
 #include "prepare_kernel.h"
@@ -822,6 +823,171 @@ PYBIND11_MODULE(_C, m) {
         "Return a read-only handle over the device address backing a Spyre "
         "tensor's storage; the handle keeps that allocation alive",
         py::arg("tensor"));
+
+  m.def("allocate_host_buffer", &spyre::allocate_host_buffer,
+        py::arg("nbytes"), py::arg("device"),
+        py::call_guard<py::gil_scoped_release>(),
+        "Allocate a CPU uint8 tensor aligned for raw Spyre DMA. No pre-pinning.");
+  m.def("dma_bytes", &spyre::dma_bytes, py::arg("dst"),
+        "Physical transfer size; 0 for a multi-chunk Spyre allocation.");
+  m.def("enqueue_copy_raw_h2d",
+        [](const at::Tensor& buffer, const at::Tensor& dst) {
+          spyre::getCurrentStream(dst.device()).copyRawH2DAsync(buffer, dst);
+        },
+        py::arg("buffer"), py::arg("dst"),
+        py::call_guard<py::gil_scoped_release>(),
+        "Enqueue device-format bytes from an aligned CPU uint8 tensor. Keep "
+        "buffer and dst alive and unchanged until synchronize_raw_h2d succeeds "
+        "on the same current stream. Enqueue failure does not drain prior work.");
+  m.def("enqueue_copy_raw_d2h",
+        [](const at::Tensor& buffer, const at::Tensor& src) {
+          spyre::getCurrentStream(src.device()).copyRawD2HAsync(buffer, src);
+        },
+        py::arg("buffer"), py::arg("src"),
+        py::call_guard<py::gil_scoped_release>(),
+        "Enqueue physical device bytes into an aligned CPU uint8 buffer without "
+        "dtype or layout conversion. Keep buffer and src alive and unchanged "
+        "until synchronize_raw_transfers succeeds on the same current stream. "
+        "Enqueue failure does not drain prior work.");
+  m.def("synchronize_raw_h2d",
+        [](c10::Device device) {
+          auto stream = spyre::getCurrentStream(device);
+          TORCH_CHECK(stream.getError() == spyre::SpyreStreamError::Success,
+                      "Raw H2D stream is shut down; completion is not guaranteed");
+          stream.synchronize();
+          TORCH_CHECK(stream.getError() == spyre::SpyreStreamError::Success,
+                      "Raw H2D stream failed; completion is not guaranteed");
+        },
+        py::arg("device"), py::call_guard<py::gil_scoped_release>(),
+        "Wait for raw transfers on this thread's current stream, rejecting shutdown. "
+        "On failure completion is not guaranteed: retain all borrowed buffers "
+        "and destinations and do not reuse them.");
+
+  m.attr("synchronize_raw_transfers") = m.attr("synchronize_raw_h2d");
+
+  m.def(
+      "convert_h2d_into",
+      [](py::list entries, unsigned int num_threads) {
+        std::vector<spyre::HostConvertTarget> targets;
+        targets.reserve(entries.size());
+        for (auto& item : entries) {
+          auto tup = item.cast<py::tuple>();
+          TORCH_CHECK(tup.size() == 3,
+                      "convert_h2d_into: each entry must be a 3-tuple "
+                      "(buffer, cpu_tensor, dst_tensor)");
+          auto buf = tup[0].cast<py::buffer>().request(/*writable=*/true);
+          targets.push_back(spyre::HostConvertTarget{
+              buf.ptr, static_cast<size_t>(buf.size * buf.itemsize),
+              tup[1].cast<at::Tensor>(), tup[2].cast<at::Tensor>()});
+        }
+        py::gil_scoped_release release;
+        spyre::convert_h2d_into(targets, num_threads);
+      },
+      py::arg("entries"), py::arg("num_threads") = 0u,
+      "Convert each (buffer, cpu_tensor, dst_tensor) entry into its writable\n"
+      "host buffer in parallel: the bytes copy_tensor(cpu_tensor, dst_tensor)\n"
+      "would DMA.  dst_tensor's device memory is not touched.");
+
+  // -------------------------------------------------------------------------
+  // host_convert_batch: embarrassingly parallel CPU-side dtype/layout
+  // conversion (row-major fp16 → Spyre stick dl16) for Phase 1 of the
+  // 2-phase weight loader.
+  //
+  // Python call:
+  //   entries = [
+  //       (memoryview(buffers[i].numpy()), src_mmap_slice_i, (cpu_tensor_i, dst_tensor_i))
+  //       for i in range(len(manifest))
+  //   ]
+  //   torch_spyre._C.host_convert_batch(entries, num_threads=64)
+  //
+  // Each entry is a 3-tuple:
+  //   [0] dst_mv : memoryview — writeable into an aligned CPU buffer
+  //   [1] src_mv : memoryview — read-only safetensors mmap slice
+  //   [2] dci    : at.Tensor pair (cpu_tensor, dst_tensor) used to build DCI
+  //
+  // After this call completes:
+  //   - buffers[i] contains Spyre stick-layout bytes
+  //   - Issue enqueue_copy_raw_h2d(buffers[i], dst_tensor) for each tensor
+  //   - Call synchronize_raw_h2d(device) before reusing or releasing buffers
+  // -------------------------------------------------------------------------
+  m.def(
+      "host_convert_batch",
+      [](py::list entries, unsigned int num_threads) {
+        // Build a std::vector<flex::HostConvertEntry> from the Python list.
+        // Each entry is (dst_memoryview, src_memoryview, (cpu_tensor, dst_tensor)).
+        // We keep the DCI objects alive by storing them alongside the entries.
+        //
+        // NOTE: This lambda executes outside namespace spyre, so all spyre-internal
+        // symbols need explicit spyre:: qualification.
+        struct EntryStorage {
+          std::shared_ptr<DataConversionInfo> dci_storage;
+          flex::HostConvertEntry entry;
+        };
+        std::vector<EntryStorage> storage;
+        storage.reserve(entries.size());
+
+        for (auto& item : entries) {
+          auto tup = item.cast<py::tuple>();
+          TORCH_CHECK(tup.size() == 3,
+                      "host_convert_batch: each entry must be a 3-tuple "
+                      "(dst_memoryview, src_memoryview, (cpu_tensor, dst_tensor))");
+
+          auto dst_buf = tup[0].cast<py::buffer>().request(/*writable=*/true);
+          auto src_buf = tup[1].cast<py::buffer>().request(/*writable=*/false);
+
+          // Build DCI from (cpu_tensor, dst_tensor) pair.
+          auto tensor_pair = tup[2].cast<py::tuple>();
+          TORCH_CHECK(tensor_pair.size() == 2,
+                      "host_convert_batch: entry[2] must be (cpu_tensor, dst_tensor)");
+          auto cpu_t = tensor_pair[0].cast<at::Tensor>();
+          auto dst_t = tensor_pair[1].cast<at::Tensor>();
+          const size_t capacity = static_cast<size_t>(dst_buf.size * dst_buf.itemsize);
+          const size_t bytes = spyre::dma_bytes(dst_t);
+          TORCH_CHECK(bytes != 0 && bytes <= capacity,
+                      "host_convert_batch: destination buffer is too small or multi-chunk");
+
+          // generate_dci: needs spyre:: qualification (lambda is outside namespace spyre).
+          // SpyreTensorImpl: same.
+          auto* spyre_ti = static_cast<spyre::SpyreTensorImpl*>(dst_t.unsafeGetTensorImpl());
+          auto dci = std::make_shared<DataConversionInfo>(
+              spyre::generate_dci(&cpu_t, &dst_t, spyre_ti->spyre_layout, /*host2device=*/true));
+
+          // Aggregate-initialise EntryStorage explicitly to avoid brace-init
+          // deduction failures when EntryStorage is a local struct type.
+          EntryStorage es;
+          es.dci_storage = dci;
+          es.entry.dst_ptr = dst_buf.ptr;
+          es.entry.src_ptr = src_buf.ptr;
+          es.entry.dci     = dci.get();
+          es.entry.dst_capacity = capacity;
+          storage.push_back(std::move(es));
+        }
+
+        // Collect raw entries for the C++ call.
+        std::vector<flex::HostConvertEntry> batch;
+        batch.reserve(storage.size());
+        for (const auto& s : storage) {
+          batch.push_back(s.entry);
+        }
+
+        // Release the GIL during the (potentially long) parallel conversion.
+        {
+          py::gil_scoped_release release;
+          flex::hostConvertBatch(batch, num_threads);
+        }
+      },
+      py::arg("entries"),
+      py::arg("num_threads") = 0u,
+      "Convert a batch of CPU tensors to Spyre stick layout in parallel.\n\n"
+      "Each entry: (dst_memoryview, src_memoryview, (cpu_tensor, dst_tensor)).\n"
+      "  dst_memoryview  -- writeable memoryview into an aligned CPU buffer\n"
+      "                     (from memoryview(allocate_host_buffer(nbytes, device).numpy()))\n"
+      "  src_memoryview  -- read-only memoryview of safetensors mmap slice\n"
+      "  (cpu_tensor, dst_tensor) -- used to derive DCI (dtype/shape/stride)\n\n"
+      "num_threads=0 means std::thread::hardware_concurrency().\n\n"
+      "After this call, use enqueue_copy_raw_h2d(buffer, dst_tensor)\n"
+      "for each entry, then synchronize_raw_h2d(device) before reusing\n"
+      "or releasing the buffers.");
 
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
